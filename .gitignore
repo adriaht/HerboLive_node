@@ -1,0 +1,31 @@
+# Node & package manager
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# dotenv / secrets
+.env
+.env.*
+.env.local
+.env.test
+.env.example
+
+# System / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build / runtime artifacts
+dist/
+build/
+coverage/
+*.log
+
+# Database / container volumes (si usas docker-compose)
+mysql_data/
+tmp/
+*.sqlite
+EOF
