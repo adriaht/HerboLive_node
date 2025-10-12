@@ -1,4 +1,4 @@
-// server.js
+// server.js (reemplaza el existente por completo)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -10,45 +10,73 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 const config = {
-  port: process.env.PORT || 3000,
-  useDbFirst: String(process.env.USE_DB_FIRST || 'true') === 'true',
-  TREFLE_TOKEN: process.env.TREFLE_TOKEN || '',
-  PERENUAL_KEY: process.env.PERENUAL_KEY || '',
+  port: parseInt(process.env.PORT || '3000', 10),
+  host: process.env.HOST || '0.0.0.0',
+  useDbFirst: (function(){
+    const v = process.env.USE_DB_FIRST || process.env.USEDBFIRST || process.env.USE_BACKEND;
+    if (typeof v === 'undefined') return true;
+    return String(v).toLowerCase() === 'true';
+  })(),
+  trefleToken: process.env.TREFLE_TOKEN || '',
+  perenualKey: process.env.PERENUAL_KEY || '',
   localCsvPath: process.env.LOCAL_CSV_PATH || path.join(__dirname, '../www/data/plant_data.csv'),
   csvMaxRead: parseInt(process.env.CSV_MAX_READ || '52', 10)
 };
+
+// logs de arranque
+console.log('Config cargada:', {
+  port: config.port,
+  host: config.host,
+  useDbFirst: config.useDbFirst,
+  localCsvPath: config.localCsvPath,
+  csvMaxRead: config.csvMaxRead
+});
 
 // DB pool and models
 const db = require('./lib/db');
 const PlantsModel = require('./lib/models/plants')(db);
 
-// External helpers (tu implementación)
+// External helpers
 const External = require('./lib/external')(config);
 
 // Routes
 const plantsRouter = require('./routes/plants')(config, PlantsModel, External);
 app.use('/api/plants', plantsRouter);
 
-// Exponer una configuración mínima para que el frontend pueda saber la preferencia
+// Exponer endpoint de config (útil para frontend para saber preferencia)
 app.get('/api/config', (req, res) => {
-  res.json({ useDbFirst: config.useDbFirst });
+  res.json({
+    ok: true,
+    useDbFirst: config.useDbFirst
+  });
 });
 
-// Health endpoint
 app.get('/health', (req, res) => {
   res.json({ ok: true, mode: config.useDbFirst ? 'db-first' : 'api-first' });
 });
 
-// Servir la carpeta estática del frontend (opcional pero práctico)
-app.use(express.static(path.join(__dirname, '../www')));
-
-
-
-// Escuchar en 0.0.0.0 para aceptar conexiones externas (emulador/dispositivo)
-const HOST = process.env.HOST || '0.0.0.0';
-app.listen(config.port, HOST, () => {
-  console.log(`HerboLive backend listening on ${HOST}:${config.port} (DB-first=${config.useDbFirst})`);
+// error handler middleware para capturar problemas no manejados
+app.use((err, req, res, next) => {
+  console.error('Unhandled err:', err && err.stack ? err.stack : err);
+  res.status(500).json({ error: 'Internal Server Error', detail: String(err) });
 });
 
+// arrancar
+const server = app.listen(config.port, config.host, () => {
+  console.log(`HerboLive backend listening on http://${config.host}:${config.port} (DB-first=${config.useDbFirst})`);
+});
 
+server.on('error', (err) => {
+  console.error('Server error:', err && err.message ? err.message : err);
+  process.exit(1);
+});
 
+// manejo de señales para apagar limpio
+process.on('SIGINT', () => {
+  console.log('SIGINT received — closing server');
+  server.close(() => process.exit(0));
+});
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received — closing server');
+  server.close(() => process.exit(0));
+});
