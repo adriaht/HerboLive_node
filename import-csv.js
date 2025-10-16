@@ -1,31 +1,30 @@
-// import-csv.js
+// import-csv.js (versión segura para import y saneamiento JSON)
+// Sustituye el archivo actual por completo con este.
+
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const db = require('./lib/db');
 const PlantsModel = require('./lib/models/plants')(db);
 
-// Intentar cargar un parser sync compatible (v5 -> 'csv-parse/sync', v4 -> 'csv-parse/lib/sync')
+// Intentar cargar parser sync (v5 -> 'csv-parse/sync', v4 -> 'csv-parse/lib/sync')
 let parseSync = null;
 try {
-  // v5 style
   ({ parse: parseSync } = require('csv-parse/sync'));
 } catch (e1) {
   try {
-    // v4 style
     parseSync = require('csv-parse/lib/sync');
   } catch (e2) {
     parseSync = null;
   }
 }
 
+// Fallback robusto (ya lo tenías)
 function robustParseCsv(csvText, maxRows = Infinity) {
-  // simple but robust line-by-line parser with quote handling (works for many malformed CSVs)
   let text = String(csvText).replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
   const lines = text.split('\n').filter(l => l.trim() !== '');
-  if (lines.length === 0) return [];
+  if (!lines.length) return [];
 
-  // detect separator by header heuristics
   const headerLine = lines.shift();
   const sepCandidates = [',',';','\t'];
   let sep = ',';
@@ -37,11 +36,11 @@ function robustParseCsv(csvText, maxRows = Infinity) {
 
   const header = parseCsvLine(headerLine, sep).map(h => h.trim());
   const out = [];
+
   for (let i = 0; i < lines.length && out.length < maxRows; i++) {
     const line = lines[i];
     if (!line || line.trim() === '') continue;
     const cols = parseCsvLine(line, sep);
-    // merge extra columns into last if more fields than header
     let rowCols = cols;
     if (cols.length > header.length) {
       const merged = [];
@@ -61,7 +60,6 @@ function robustParseCsv(csvText, maxRows = Infinity) {
   return out;
 }
 
-// parseCsvLine con soporte de comillas dobles y escapes ""
 function parseCsvLine(line, sep) {
   const fields = [];
   let cur = '';
@@ -93,7 +91,6 @@ function parseCsvWithFallback(csvText, opts = {}) {
   const maxRows = opts.maxRows || Infinity;
   if (parseSync) {
     try {
-      // usar csv-parse si está disponible
       const records = parseSync(csvText, Object.assign({
         columns: true,
         skip_empty_lines: true,
@@ -107,43 +104,40 @@ function parseCsvWithFallback(csvText, opts = {}) {
       return robustParseCsv(csvText, maxRows);
     }
   } else {
-    // fallback propio
     return robustParseCsv(csvText, maxRows);
   }
 }
 
-// Normalizar registros al esquema que espera tu app (snake_case / campos del CSV)
+// Mapper del CSV a objeto intermedio (con claves tal cual del CSV)
 function mapRecordToPlant(r) {
   const get = (o, keys) => {
     for (const k of keys) {
-      if (o[k] !== undefined) return o[k];
-      const lower = k.toLowerCase();
-      // also try lowercase keys
+      if (o[k] !== undefined && o[k] !== null) return o[k];
+      // buscar key case-insensitive
       for (const ok of Object.keys(o)) {
-        if (ok.toLowerCase() === lower) return o[ok];
+        if (ok.toLowerCase() === String(k).toLowerCase() && o[ok] !== undefined) return o[ok];
       }
     }
     return '';
   };
 
-  const poll = (v) => {
-    if (!v && v !== 0) return [];
-    const s = String(v).trim();
+  const parseMaybeList = (value) => {
+    if (value === undefined || value === null) return [];
+    const s = String(value).trim();
     if (!s) return [];
     if (s.startsWith('[') && s.endsWith(']')) {
-      try { return JSON.parse(s.replace(/'/g, '"')); } catch(e) {
-        const inner = s.slice(1,-1); return inner.split(',').map(x => x.replace(/^["']|["']$/g,'').trim()).filter(Boolean);
-      }
+      try { return JSON.parse(s.replace(/'/g, '"')); } catch (e) {/* fallthrough */ }
     }
     if (s.includes(',')) return s.split(',').map(x => x.trim()).filter(Boolean);
     if (s.includes(';')) return s.split(';').map(x => x.trim()).filter(Boolean);
     return [s];
   };
 
-  const mapped = {
+  return {
     Family: get(r, ['Family','family']),
     Genus: get(r, ['Genus','genus']),
     Species: get(r, ['Species','species']),
+    ScientificName: (get(r, ['ScientificName','Scientific Name','scientific_name']) || ((get(r,['Genus'])||'') + ' ' + (get(r,['Species'])||'')).trim()),
     CommonName: get(r, ['CommonName','Common Name','common_name','commonname','Common']),
     GrowthRate: get(r, ['GrowthRate','growth_rate','growthrate']),
     HardinessZones: get(r, ['HardinessZones','hardiness_zones']),
@@ -151,46 +145,140 @@ function mapRecordToPlant(r) {
     Width: get(r, ['Width','width']),
     Type: get(r, ['Type','type']),
     Foliage: get(r, ['Foliage','foliage']),
-    Pollinators: poll(get(r, ['Pollinators','pollinators'])),
+    Pollinators: parseMaybeList(get(r, ['Pollinators','pollinators'])),
     Leaf: get(r, ['Leaf','leaf']),
     Flower: get(r, ['Flower','flower']),
     Ripen: get(r, ['Ripen','ripen']),
     Reproduction: get(r, ['Reproduction','reproduction']),
-    Soils: get(r, ['Soils','soils']),
+    Soils: parseMaybeList(get(r, ['Soils','soils'])),
     pH: get(r, ['pH','Ph','p_h']),
-    pH_split: get(r, ['pH_split','p_h_split']),
+    pH_split: parseMaybeList(get(r, ['pH_split','p_h_split'])),
     Preferences: get(r, ['Preferences','preferences']),
     Tolerances: get(r, ['Tolerances','tolerances']),
     Habitat: get(r, ['Habitat','habitat']),
-    HabitatRange: get(r, ['HabitatRange','habitat_range','habitatrange']),
+    HabitatRange: get(r, ['HabitatRange','habitatrange','habitat_range']),
     Edibility: get(r, ['Edibility','edibility']),
     Medicinal: get(r, ['Medicinal','medicinal','Medicinal_Uses','Medicinal Uses']),
     OtherUses: get(r, ['OtherUses','other_uses','Other Uses']),
     PFAF: get(r, ['PFAF','pfaf']),
     ImageURL: get(r, ['Image URL','Image','image_url','image'])
   };
-
-  return mapped;
 }
 
-// MAIN
+// SANEAMIENTO: asegurar campos JSON válidos o NULL
+function ensureJsonArrayField(obj, key) {
+  const raw = obj[key];
+  if (raw === undefined || raw === null) { obj[key] = null; return; }
+  if (Array.isArray(raw)) {
+    // eliminar elementos vacíos y valores inválidos
+    const cleaned = raw.map(x => String(x).trim()).filter(x => x && x.toLowerCase() !== 'invalid value.' && x.toLowerCase() !== 'invalid');
+    obj[key] = cleaned.length ? JSON.stringify(cleaned) : null;
+    return;
+  }
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (!s || s.toLowerCase() === 'invalid value.' || s.toLowerCase() === 'invalid') { obj[key] = null; return; }
+    if (s.startsWith('[') || s.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(s);
+        if (Array.isArray(parsed)) { obj[key] = JSON.stringify(parsed.filter(x=>x)); return; }
+        // if object -> stringify as-is
+        obj[key] = JSON.stringify(parsed);
+        return;
+      } catch (e) {
+        // fallthrough
+      }
+    }
+    // otherwise convert scalar to array
+    obj[key] = JSON.stringify([s]);
+    return;
+  }
+  // other types (number etc.)
+  try {
+    obj[key] = JSON.stringify([raw]);
+  } catch (e) {
+    obj[key] = null;
+  }
+}
+
+function sanitizeRecordForDb(rec) {
+  // campos que queremos almacenar como JSON (si existen)
+  const jsonFields = ['Pollinators','Soils','pH_split','Images','OtherUses','Preferences','Tolerances'];
+  const out = Object.assign({}, rec);
+  // rename ImageURL -> image_url for compatibility (si tu modelo espera otro nombre ajusta)
+  if (out.ImageURL && !out.image_url) out.image_url = out.ImageURL;
+  // ensure JSON fields
+  for (const k of jsonFields) {
+    if (out[k] !== undefined) ensureJsonArrayField(out, k);
+  }
+  // ensure images key exists as JSON array if present as string
+  if (out.image_url && !out.Images && !out.images) {
+    out.images = [out.image_url];
+  }
+  if (out.images && Array.isArray(out.images)) {
+    try { out.images = JSON.stringify(out.images.map(x=>String(x).trim()).filter(Boolean)); } catch(e) { out.images = null; }
+  } else if (typeof out.images === 'string') {
+    // try to parse or convert to single-element array
+    const s = out.images.trim();
+    if (s.startsWith('[')) {
+      try { JSON.parse(s); out.images = s; } catch(e) { out.images = JSON.stringify([s]); }
+    } else {
+      out.images = JSON.stringify([s]);
+    }
+  } else {
+    out.images = null;
+  }
+  return out;
+}
+
+// Inserción en DB por lotes con fallback por fila (para identificar filas problemáticas)
+async function upsertInBatches(plants, batchSize = 500) {
+  for (let i = 0; i < plants.length; i += batchSize) {
+    const chunk = plants.slice(i, i + batchSize);
+    try {
+      await PlantsModel.upsertMany(chunk);
+      console.log(`Lote ${i}-${i+chunk.length-1} insertado OK`);
+    } catch (err) {
+      console.error(`Error en lote ${i}-${i+chunk.length-1}:`, err && err.message ? err.message : err);
+      // intentar uno a uno para localizar filas problemáticas
+      for (let j = 0; j < chunk.length; j++) {
+        const single = [chunk[j]];
+        try {
+          await PlantsModel.upsertMany(single);
+        } catch (e) {
+          console.error(`  -> Error en fila index global ${i+j} (registro problemático):`, e && e.message ? e.message : e);
+          // dump a un archivo para inspección
+          try {
+            const dumpPath = path.join(process.cwd(), `failed_row_${i+j}.json`);
+            fs.writeFileSync(dumpPath, JSON.stringify(chunk[j], null, 2), 'utf8');
+            console.error(`     Registro guardado en ${dumpPath}`);
+          } catch (werr) {
+            console.error('     Error guardando registro problemático:', werr);
+          }
+        }
+      }
+    }
+  }
+}
+
 (async function main(){
   try {
     const csvPath = path.resolve(process.env.LOCAL_CSV_PATH || path.join(__dirname, '../www/data/plant_data.csv'));
     console.log(`Leyendo CSV desde ${csvPath}`);
     const csvData = fs.readFileSync(csvPath, 'utf8');
-
     const maxRows = parseInt(process.env.CSV_MAX_READ || '99999', 10);
-    const records = parseCsvWithFallback(csvData, { maxRows });
 
+    const records = parseCsvWithFallback(csvData, { maxRows });
     console.log(`Filas parseadas: ${records.length}`);
 
-    const plants = records.map(r => mapRecordToPlant(r));
+    const mapped = records.map(r => mapRecordToPlant(r));
+    // aplicar saneamiento y convertir campos a JSON válidos
+    const sanitized = mapped.map(m => sanitizeRecordForDb(m));
 
-    console.log('Insertando/actualizando plantas en DB...');
-    await PlantsModel.upsertMany(plants);
+    console.log('Insertando/actualizando plantas en DB (con saneamiento) ...');
+    await upsertInBatches(sanitized, 500);
 
-    console.log('✅ Importación completada');
+    console.log('✅ Importación finalizada');
     process.exit(0);
   } catch (err) {
     console.error('Import error', err && err.stack ? err.stack : err);
