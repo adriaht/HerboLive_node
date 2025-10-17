@@ -39,9 +39,16 @@ const PlantsModel = require('./lib/models/plants')(db);
 // External helpers
 const External = require('./lib/external')(config);
 
+
+
+const apiRouter = require('./routes/api')(config, PlantsModel, External, db);
+
+
+
 // Routes
 const plantsRouter = require('./routes/plants')(config, PlantsModel, External);
 app.use('/api/plants', plantsRouter);
+app.use('/api', apiRouter);
 
 // Exponer endpoint de config (útil para frontend para saber preferencia)
 app.get('/api/config', (req, res) => {
