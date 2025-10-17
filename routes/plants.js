@@ -1,19 +1,21 @@
 // routes/plants.js
-// Factory: module.exports = (config, PlantsModel, External) => router;
+// Factory: module.exports = (config, PlantsModel, External, db) => router;
 const express = require('express');
 const db = require('../lib/db');
 
-// Intentamos requerir el traductor; si no existe, el módulo seguirá funcionando sin traducción.
-let translator = null;
-try {
-  translator = require('../lib/translate');
-} catch (e) {
-  // no traductor disponible -> continuar sin traducción
-  translator = null;
-}
-
 module.exports = function (config = {}, PlantsModel = null, External = null) {
   const router = express.Router();
+
+  // load translator factory (optional)
+  let Translator = null;
+  try {
+    Translator = require('../lib/translate')(config);
+  } catch (e) {
+    Translator = null;
+    console.warn('Translator not available:', e && e.message ? e.message : e);
+  }
+
+  const TRANSLATE_ENABLED = (Translator && Translator.provider && Translator.provider !== 'none');
 
   // runQuery: ejecuta una consulta soportando distintos clientes
   async function runQuery(sql, params = []) {
@@ -31,7 +33,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     }
   }
 
-  // Helpers
+  // Helpers (idem a tu versión)
   function parseLista(val) {
     if (val == null) return [];
     if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
@@ -87,7 +89,8 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     const tolerancesRaw = getFromRow(row, 'Tolerances', 'tolerances') || '';
 
     return {
-      family: getFromRow(row, 'Family', 'family') || '',
+      id: getFromRow(row, 'id', 'ID') || null,
+      family: (getFromRow(row, 'Family', 'family') || '') + '',
       genus: genus || '',
       species: species || '',
       scientific_name: scientific_guess || '',
@@ -121,13 +124,6 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     };
   }
 
-  // campos que queremos traducir cuando el traductor está activo
-  const fieldsToTranslate = [
-    'family','scientific_name','common_name','growth_rate','hardiness_zones','height','width',
-    'type','foliage','leaf','flower','ripen','reproduction','soils','ph','preferences','tolerances',
-    'habitat','habitat_range','other_uses','description'
-  ];
-
   // GET / -> lista normalizada. Soporta ?limit=NUMBER
   router.get('/', async (req, res) => {
     try {
@@ -147,14 +143,15 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
       if (!Array.isArray(rows)) rows = [];
       let plants = rows.map(normalizeRow);
 
-      // si hay traductor y está habilitado, intentamos traducir campos relevantes
-      if (translator && translator.ENABLE_TRANSLATE) {
+      // Translate list elements if enabled (careful: may slow down list endpoints)
+      if (TRANSLATE_ENABLED) {
         try {
-          const translated = await Promise.all(plants.map(p => translator.translateObject(p, fieldsToTranslate)));
-          plants = translated;
+          // translate only selected fields for each plant - do not block entire request for too long
+          const translateFields = ['common_name','type','foliage'];
+          const promises = plants.map(p => Translator.translateObjectFields(p, translateFields, Translator.target).catch(e => p));
+          plants = await Promise.all(promises);
         } catch (e) {
-          console.warn('translateObject failed for list:', e && e.message ? e.message : e);
-          // en caso de fallo dejamos plants sin traducir
+          console.warn('Translation (list) failed:', e && e.message ? e.message : e);
         }
       }
 
@@ -165,7 +162,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     }
   });
 
-  // GET /:id -> planta por id
+  // GET /:id -> planta por id (enriquecimiento + guardado de campos faltantes), y traducción opcional
   router.get('/:id', async (req, res) => {
     const id = req.params.id;
     try {
@@ -180,17 +177,124 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
 
       if (!row) return res.status(404).json({ error: 'No encontrada' });
 
-      let plant = normalizeRow(row);
+      // normalizamos
+      let normalized = normalizeRow(row);
 
-      if (translator && translator.ENABLE_TRANSLATE) {
+      // Enriquecimiento (solo si config.useDbFirst y External está presente)
+      if (config.useDbFirst && External && typeof External === 'object') {
         try {
-          plant = await translator.translateObject(plant, fieldsToTranslate);
+          const candidateName = normalized.scientific_name || `${normalized.genus} ${normalized.species}`.trim() || normalized.common_name || '';
+          let extra = null;
+
+          if (candidateName && typeof External.fetchByScientificName === 'function') {
+            extra = await External.fetchByScientificName(candidateName);
+          }
+          if (!extra && typeof External.fetchFromTrefle === 'function') {
+            extra = await External.fetchFromTrefle(candidateName || normalized.common_name || '');
+          }
+          if (!extra && typeof External.fetchFromPerenual === 'function') {
+            extra = await External.fetchFromPerenual(candidateName || normalized.common_name || '');
+          }
+          if (!extra && typeof External.fetchGeneric === 'function') {
+            extra = await External.fetchGeneric(candidateName || normalized.common_name || '');
+          }
+
+          if (extra && typeof extra === 'object') {
+            // normalize and merge but prefer DB values (only fill empties)
+            const extraNorm = {
+              family: extra.family || extra.Family || '',
+              genus: extra.genus || extra.Genus || '',
+              species: extra.species || extra.Species || '',
+              scientific_name: extra.scientific_name || extra.scientificName || extra.ScientificName || '',
+              common_name: extra.common_name || extra.CommonName || extra.CommonName || '',
+              growth_rate: extra.growth_rate || extra.GrowthRate || '',
+              hardiness_zones: extra.hardiness_zones || extra.HardinessZones || '',
+              height: extra.height || extra.Height || '',
+              width: extra.width || extra.Width || '',
+              type: extra.type || extra.Type || '',
+              foliage: extra.foliage || extra.Foliage || '',
+              pollinators: Array.isArray(extra.pollinators) ? extra.pollinators : (extra.Pollinators || []),
+              leaf: extra.leaf || extra.Leaf || '',
+              flower: extra.flower || extra.Flower || '',
+              ripen: extra.ripen || extra.Ripen || '',
+              reproduction: extra.reproduction || extra.Reproduction || '',
+              soils: Array.isArray(extra.soils) ? extra.soils : (extra.Soils || []),
+              ph: extra.ph || extra.pH || '',
+              ph_split: Array.isArray(extra.ph_split) ? extra.ph_split : (extra.pH_split || []),
+              preferences: Array.isArray(extra.preferences) ? extra.preferences : (extra.Preferences || []),
+              tolerances: Array.isArray(extra.tolerances) ? extra.tolerances : (extra.Tolerances || []),
+              habitat: extra.habitat || extra.Habitat || '',
+              habitat_range: extra.habitat_range || extra.HabitatRange || '',
+              edibility: (typeof extra.edibility !== 'undefined') ? extra.edibility : extra.Edibility,
+              medicinal: (typeof extra.medicinal !== 'undefined') ? extra.medicinal : extra.Medicinal,
+              other_uses: extra.other_uses || extra.OtherUses || '',
+              pfaf: extra.pfaf || extra.PFAF || '',
+              image_url: extra.image_url || extra.ImageURL || extra.Image || '',
+              images: extra.images && Array.isArray(extra.images) ? extra.images : (extra.Images && Array.isArray(extra.Images) ? extra.Images : []),
+              description: extra.description || extra.Description || extra.description_text || ''
+            };
+
+            const toSaveDb = {};
+            const dbFieldMap = {
+              family: 'Family', genus: 'Genus', species: 'Species', common_name: 'CommonName',
+              growth_rate: 'GrowthRate', hardiness_zones: 'HardinessZones', height: 'Height', width: 'Width',
+              type: 'Type', foliage: 'Foliage', pollinators: 'Pollinators', leaf: 'Leaf', flower: 'Flower',
+              ripen: 'Ripen', reproduction: 'Reproduction', soils: 'Soils', ph: 'pH', ph_split: 'pH_split',
+              preferences: 'Preferences', tolerances: 'Tolerances', habitat: 'Habitat', habitat_range: 'HabitatRange',
+              edibility: 'Edibility', medicinal: 'Medicinal', other_uses: 'OtherUses', pfaf: 'PFAF',
+              image_url: 'ImageURL', images: 'images', description: 'description'
+            };
+
+            const merged = Object.assign({}, normalized);
+
+            for (const key of Object.keys(extraNorm)) {
+              const val = extraNorm[key];
+              if ((merged[key] === null || merged[key] === '' || (Array.isArray(merged[key]) && merged[key].length === 0))) {
+                if (val !== null && val !== '' && !(Array.isArray(val) && val.length === 0)) {
+                  merged[key] = val;
+                  const dbCol = dbFieldMap[key];
+                  if (dbCol) {
+                    toSaveDb[dbCol] = Array.isArray(val) ? JSON.stringify(val) : val;
+                  }
+                }
+              }
+            }
+
+            if (Object.keys(toSaveDb).length > 0) {
+              try {
+                if (PlantsModel && typeof PlantsModel.updateById === 'function') {
+                  await PlantsModel.updateById(normalized.id, toSaveDb);
+                } else {
+                  const cols = Object.keys(toSaveDb).map(c => `\`${c}\` = ?`).join(', ');
+                  const params = Object.keys(toSaveDb).map(k => toSaveDb[k]);
+                  params.push(normalized.id);
+                  const sql = `UPDATE plants SET ${cols}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
+                  await runQuery(sql, params);
+                }
+              } catch (e) {
+                console.warn('No se pudo persistir enriquecimiento en DB (no crítico):', e && e.message ? e.message : e);
+              }
+            }
+
+            normalized = merged;
+          }
         } catch (e) {
-          console.warn('translateObject failed for item id=' + id + ':', e && e.message ? e.message : e);
+          console.warn('Enriquecimiento externo falló (no crítico):', e && e.message ? e.message : e);
         }
       }
 
-      res.json(plant);
+      // Traducción opcional: traduce campos textuales antes de devolver si está habilitado
+      if (TRANSLATE_ENABLED && Translator) {
+        try {
+          const translateFields = ['common_name','type','foliage','leaf','flower','habitat','habitat_range','preferences','other_uses','description'];
+          normalized = await Translator.translateObjectFields(normalized, translateFields, Translator.target);
+        } catch (e) {
+          console.warn('translateObjectFields failed:', e && e.message ? e.message : e);
+          // no rompemos la respuesta por fallo en traducción
+        }
+      }
+
+      res.json(normalized);
     } catch (err) {
       console.error('Error en GET /api/plants/:id ->', err);
       res.status(500).json({ error: 'Error interno', detail: String(err && err.message ? err.message : err) });
