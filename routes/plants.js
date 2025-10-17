@@ -5,6 +5,7 @@ const db = require('../lib/db');
 module.exports = function (config = {}, PlantsModel = null, External = null) {
   const router = express.Router();
 
+  // optional translator (best-effort)
   let Translator = null;
   try { Translator = require('../lib/translate')(config); } catch (e) { Translator = null; console.warn('Translator not available:', e && e.message ? e.message : e); }
   const TRANSLATE_ENABLED = (Translator && Translator.provider && Translator.provider !== 'none');
@@ -24,6 +25,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     }
   }
 
+  // small helpers
   function parseLista(val) {
     if (val == null) return [];
     if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
@@ -114,7 +116,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     };
   }
 
-  // GET /
+  // GET / -> lista normalizada
   router.get('/', async (req, res) => {
     try {
       let rows = [];
@@ -150,31 +152,70 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     }
   });
 
-  // GET /:id -> con LOG de depuración
+  // GET /:id -> planta por id (ROBUST: intenta varias consultas y guarda trazas)
   router.get('/:id', async (req, res) => {
-    const id = req.params.id;
+    const idParam = req.params.id;
     try {
-      let row = null;
+      console.log(`[trace] GET /api/plants/${idParam} - comienzo`);
 
+      // 1) Si PlantsModel dispone de findById, pruébalo primero
+      let row = null;
       if (PlantsModel && typeof PlantsModel.findById === 'function') {
-        row = await PlantsModel.findById(id);
-        console.log(`[debug] PlantsModel.findById(${id}) ->`, !!row);
-      } else {
-        const sql = 'SELECT * FROM plants WHERE id = ? LIMIT 1';
-        const rows = await runQuery(sql, [id]);
-        row = (Array.isArray(rows) && rows[0]) ? rows[0] : rows;
-        console.log(`[debug] runQuery SELECT id=${id} -> rowsCount=${Array.isArray(rows)?rows.length:(rows?1:0)}`);
+        try {
+          row = await PlantsModel.findById(idParam);
+          console.log(`[trace] PlantsModel.findById(${idParam}) -> ${!!row}`);
+        } catch (e) {
+          console.warn('[trace] PlantsModel.findById error:', e && e.message ? e.message : e);
+          row = null;
+        }
+      }
+
+      // 2) Si no hay fila, prueba consultas SQL explícitas (id numérico, genus+species, commonname)
+      if (!row) {
+        // try id numeric
+        if (!Number.isNaN(Number(idParam))) {
+          console.log('[trace] intentando SELECT por id numérico');
+          const rows = await runQuery('SELECT * FROM plants WHERE id = ? LIMIT 1', [Number(idParam)]);
+          if (Array.isArray(rows) && rows.length > 0) row = rows[0];
+          else if (rows && rows.id) row = rows;
+          console.log('[trace] resultado SELECT id ->', Array.isArray(rows) ? rows.length : (row ? 1 : 0));
+        }
+
+        // try scientific name / genus species fallback
+        if (!row) {
+          const guess = idParam.replace(/\+/g,' ').trim(); // allow "Genus+species"
+          if (guess.includes(' ')) {
+            const parts = guess.split(/\s+/);
+            if (parts.length >= 2) {
+              const g = parts[0];
+              const s = parts.slice(1).join(' ');
+              console.log('[trace] intentando SELECT por Genus+Species', g, s);
+              const rows2 = await runQuery('SELECT * FROM plants WHERE Genus = ? AND Species = ? LIMIT 1', [g, s]);
+              if (Array.isArray(rows2) && rows2.length > 0) row = rows2[0];
+              console.log('[trace] resultado SELECT Genus+Species ->', Array.isArray(rows2) ? rows2.length : (row ? 1 : 0));
+            }
+          }
+        }
+
+        // try CommonName search
+        if (!row) {
+          console.log('[trace] intentando SELECT por CommonName LIKE');
+          const like = `%${idParam}%`;
+          const rows3 = await runQuery('SELECT * FROM plants WHERE CommonName LIKE ? LIMIT 1', [like]);
+          if (Array.isArray(rows3) && rows3.length > 0) row = rows3[0];
+          console.log('[trace] resultado SELECT CommonName ->', Array.isArray(rows3) ? rows3.length : (row ? 1 : 0));
+        }
       }
 
       if (!row) {
-        console.warn(`[debug] Planta id=${id} no encontrada en DB`);
+        console.warn(`[trace] Planta idParam='${idParam}' no encontrada`);
         return res.status(404).json({ error: 'No encontrada' });
       }
 
+      console.log('[trace] Planta encontrada en DB, normalizando...');
       let normalized = normalizeRow(row);
 
-      // enriquecimiento igual que antes (omito repetir detalle aqui para brevedad)
-      // (mantengo tu lógica de External exactamente como tenías en la versión previa)
+      // Enriquecimiento (si DB-first): intenta obtener info externa y persiste nuevos campos (si aplica)
       if (config.useDbFirst && External && typeof External === 'object') {
         try {
           const candidateName = normalized.scientific_name || `${normalized.genus} ${normalized.species}`.trim() || normalized.common_name || '';
@@ -184,7 +225,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
           if (!extra && typeof External.fetchFromPerenual === 'function') extra = await External.fetchFromPerenual(candidateName || normalized.common_name || '');
           if (!extra && typeof External.fetchGeneric === 'function') extra = await External.fetchGeneric(candidateName || normalized.common_name || '');
           if (extra && typeof extra === 'object') {
-            // merge ligero sin sobreescribir campos ya presentes
+            // merge sin sobrescribir
             const fieldsToFill = ['family','genus','species','scientific_name','common_name','growth_rate','hardiness_zones','height','width','type','foliage','pollinators','leaf','flower','ripen','reproduction','soils','ph','ph_split','preferences','tolerances','habitat','habitat_range','edibility','medicinal','other_uses','pfaf','image_url','images','description'];
             const toSaveDb = {};
             const dbFieldMap = {
@@ -196,16 +237,11 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
               edibility: 'Edibility', medicinal: 'Medicinal', other_uses: 'OtherUses', pfaf: 'PFAF',
               image_url: 'ImageURL', images: 'images', description: 'description'
             };
-            const extraNorm = {};
-            for (const k of fieldsToFill) {
-              extraNorm[k] = extra[k] || extra[ k.charAt(0).toUpperCase() + k.slice(1) ] || '';
-            }
-            const merged = Object.assign({}, normalized);
-            for (const key of Object.keys(extraNorm)) {
-              const val = extraNorm[key];
-              if ((merged[key] === null || merged[key] === '' || (Array.isArray(merged[key]) && merged[key].length === 0))) {
+            for (const key of fieldsToFill) {
+              const val = extra[key] || extra[key.charAt(0).toUpperCase() + key.slice(1)] || '';
+              if ((normalized[key] === null || normalized[key] === '' || (Array.isArray(normalized[key]) && normalized[key].length === 0))) {
                 if (val !== null && val !== '' && !(Array.isArray(val) && val.length === 0)) {
-                  merged[key] = val;
+                  normalized[key] = val;
                   const dbCol = dbFieldMap[key];
                   if (dbCol) toSaveDb[dbCol] = Array.isArray(val) ? JSON.stringify(val) : val;
                 }
@@ -222,17 +258,18 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
                   const sql = `UPDATE plants SET ${cols}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
                   await runQuery(sql, params);
                 }
+                console.log('[trace] Enriquecimiento persistido en DB');
               } catch (e) {
                 console.warn('No se pudo persistir enriquecimiento en DB (no crítico):', e && e.message ? e.message : e);
               }
             }
-            normalized = merged;
           }
         } catch (e) {
           console.warn('Enriquecimiento externo falló (no crítico):', e && e.message ? e.message : e);
         }
       }
 
+      // Traducción (si activado)
       if (TRANSLATE_ENABLED && Translator) {
         try {
           const translateFields = ['common_name','type','foliage','leaf','flower','habitat','habitat_range','preferences','other_uses','description'];
@@ -242,9 +279,10 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
         }
       }
 
+      console.log('[trace] Respondiendo planta normalizada id=', normalized.id);
       res.json(normalized);
     } catch (err) {
-      console.error('Error en GET /api/plants/:id ->', err);
+      console.error('Error en GET /api/plants/:id ->', err && err.stack ? err.stack : err);
       res.status(500).json({ error: 'Error interno', detail: String(err && err.message ? err.message : err) });
     }
   });
