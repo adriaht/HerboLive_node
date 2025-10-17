@@ -117,25 +117,6 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     };
   }
 
-  // small utility: try translate text (best-effort)
-  async function tryTranslate(text) {
-    if (!TRANSLATE_ENABLED || !text) return text;
-    try {
-      if (typeof Translator.translateText === 'function') {
-        const tgt = config.TRANSLATE_TARGET || process.env.TRANSLATE_TARGET || 'es';
-        return await Translator.translateText(text, tgt);
-      }
-      if (typeof Translator.translate === 'function') {
-        const tgt = config.TRANSLATE_TARGET || process.env.TRANSLATE_TARGET || 'es';
-        return await Translator.translate(text, tgt);
-      }
-      return text;
-    } catch (e) {
-      console.warn('translateText error:', e && e.message ? e.message : e);
-      return text;
-    }
-  }
-
   // GET / -> lista normalizada. Soporta ?limit=NUMBER
   router.get('/', async (req, res) => {
     try {
@@ -161,10 +142,10 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     }
   });
 
-  // GET /:id -> planta por id, con enriquecimiento y persistencia desde External (si procede)
+  // GET /:id -> planta por id
   router.get('/:id', async (req, res) => {
     const id = req.params.id;
-    console.log('[trace] GET /api/plants/:id id=', id, ' use PlantsModel?', !!PlantsModel, 'External?', !!External, 'Translator?', !!Translator);
+    console.log('[trace] GET /api/plants/:id id=', id, ' use PlantsModel?', !!PlantsModel, 'Translator?', !!Translator);
 
     try {
       let row = null;
@@ -172,19 +153,23 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
       // 1) intenta usar PlantsModel si está disponible
       if (PlantsModel && typeof PlantsModel.findById === 'function') {
         try {
+          console.log('[trace] -> calling PlantsModel.findById(', id, ')');
           row = await PlantsModel.findById(id);
+          console.log('[trace] -> PlantsModel.findById returned:', !!row);
         } catch (e) {
           console.warn('[warn] PlantsModel.findById threw:', String(e && e.message ? e.message : e));
           row = null;
         }
       }
 
-      // 2) fallback a consulta directa
+      // 2) Si no encontramos nada, intenta una consulta directa al pool (fallback)
       if (!row) {
         try {
+          console.log('[trace] -> fallback: querying DB directly for id=', id);
           const rows = await runQuery('SELECT * FROM plants WHERE id = ? LIMIT 1', [id]);
           if (Array.isArray(rows) && rows.length) row = rows[0];
-          else if (rows && rows.id) row = rows;
+          else if (rows && rows.id) row = rows; // por si runQuery devolvió un objeto
+          console.log('[trace] -> direct DB query returned:', !!row);
         } catch (e) {
           console.error('[error] direct DB query failed:', e && e.message ? e.message : e);
           row = null;
@@ -196,136 +181,9 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
         return res.status(404).json({ error: 'No encontrada' });
       }
 
-      // Normaliza la fila actual
-      let normal = normalizeRow(row);
-
-      // Si tenemos External y faltan datos (ej. description vacía), intentamos enriquecer
-      const needs = {
-        description: !normal.description || normal.description === '',
-        habitat: !normal.habitat || normal.habitat === ''
-      };
-
-      if (External && (needs.description || needs.habitat)) {
-        try {
-          // clave de búsqueda: scientific_name preferido, si no genera con genus+species
-          const key = normal.scientific_name || ((normal.genus && normal.species) ? `${normal.genus} ${normal.species}` : null);
-
-          let ext = null;
-          if (key && typeof External.fetchByScientificName === 'function') {
-            try { ext = await External.fetchByScientificName(key); } catch (e) { ext = null; }
-          }
-          if (!ext && normal.genus && normal.species && typeof External.findByGenusSpecies === 'function') {
-            try { ext = await External.findByGenusSpecies(normal.genus, normal.species); } catch (e) { ext = null; }
-          }
-          if (!ext && typeof External.search === 'function') {
-            try { ext = await External.search(key || `${normal.genus} ${normal.species}`); } catch (e) { ext = null; }
-          }
-
-          if (ext && typeof ext === 'object') {
-            // Crear objeto de actualización sólo con campos nuevos (no sobreescribir si ya hay datos)
-            const up = {};
-
-            // siempre incluir al menos Genus/Species para que upsert encuentre la fila
-            up.Genus = normal.genus || ext.Genus || ext.genus || null;
-            up.Species = normal.species || ext.Species || ext.species || null;
-            up.CommonName = normal.common_name || ext.CommonName || ext.common_name || ext.common || null;
-
-            // campos a considerar (si ext los tiene y DB no los tiene, los añadimos)
-            const textFields = [
-              ['description', 'description', 'description_text', 'summary', 'long_description', 'notes'],
-              ['Habitat', 'Habitat'],
-              ['HabitatRange', 'HabitatRange', 'habitat_range'],
-              ['OtherUses', 'OtherUses', 'other_uses'],
-              ['PFAF', 'PFAF', 'pfaf'],
-              ['ImageURL', 'ImageURL', 'image_url', 'image']
-            ];
-            for (const cand of textFields) {
-              // cand[0] será la clave de destino en DB si existe; buscamos en ext por cualquiera de las variantes
-              const destKey = cand[0];
-              let found = null;
-              for (const k of cand) {
-                if (Object.prototype.hasOwnProperty.call(ext, k) && ext[k] != null && String(ext[k]).trim() !== '') {
-                  found = ext[k];
-                  break;
-                }
-              }
-              if (found) {
-                // solo insertar si DB no tenía valor
-                const currentVal = normal[destKey === 'description' ? 'description' : destKey === 'Habitat' ? 'habitat' : (destKey === 'HabitatRange' ? 'habitat_range' : destKey.toLowerCase())];
-                if (!currentVal || currentVal === '') {
-                  // mapear a la propiedad que espera upsertMany (use may be case-insensitive)
-                  up[destKey] = found;
-                }
-              }
-            }
-
-            // si hay pollinators/soils/arrays en ext, los ponemos
-            if (!normal.soils || !normal.soils.length) {
-              if (ext.Soils || ext.soils) up.Soils = ext.Soils || ext.soils;
-            }
-            if ((!normal.pollinators || !normal.pollinators.length) && (ext.Pollinators || ext.pollinators)) {
-              up.Pollinators = ext.Pollinators || ext.pollinators;
-            }
-
-            // si up sólo tiene genus/species/commonName y nada más, no hace falta upsert
-            const hasUseful = Object.keys(up).some(k => !['Genus','Species','CommonName'].includes(k));
-            if (hasUseful && PlantsModel && typeof PlantsModel.upsertMany === 'function') {
-              try {
-                // upsertMany espera claves con mayúsculas como en CSV; le pasamos el objeto
-                await PlantsModel.upsertMany([up]);
-                // re-leer la fila actualizada
-                if (PlantsModel && typeof PlantsModel.findById === 'function') {
-                  const newRow = await PlantsModel.findById(id);
-                  if (newRow) row = newRow;
-                } else {
-                  const rows = await runQuery('SELECT * FROM plants WHERE id = ? LIMIT 1', [id]);
-                  if (Array.isArray(rows) && rows.length) row = rows[0];
-                }
-                normal = normalizeRow(row);
-                console.log('[trace] -> enriched DB for id=', id);
-              } catch (e) {
-                console.warn('[warn] upsertMany failed:', e && e.message ? e.message : e);
-              }
-            }
-          }
-        } catch (e) {
-          console.warn('[warn] External enrichment failed:', e && e.message ? e.message : e);
-        }
-      } // end enrichment
-
-      // Tras enriquecimiento, si está activo el traductor, traducimos campos visibles (non-destructive)
-      if (TRANSLATE_ENABLED) {
-        try {
-          // campos a traducir: description, habitat, habitat_range, preferences (array -> join), other_uses
-          const toTranslate = {};
-          if (normal.description) toTranslate.description = normal.description;
-          if (normal.habitat) toTranslate.habitat = normal.habitat;
-          if (normal.habitat_range) toTranslate.habitat_range = normal.habitat_range;
-          if (Array.isArray(normal.preferences) && normal.preferences.length) toTranslate.preferences = normal.preferences.join('; ');
-          else if (normal.preferences) toTranslate.preferences = normal.preferences;
-          if (normal.other_uses) toTranslate.other_uses = normal.other_uses;
-
-          const keys = Object.keys(toTranslate);
-          if (keys.length) {
-            // traducir en paralelo (pero con control de errores)
-            await Promise.all(keys.map(async (k) => {
-              try {
-                const translated = await tryTranslate(toTranslate[k]);
-                if (translated && translated !== toTranslate[k]) {
-                  // aplicar traducción en la estructura final (no en DB)
-                  if (k === 'preferences') normal.preferences = String(translated).split(';').map(x => x.trim()).filter(Boolean);
-                  else normal[k] = translated;
-                }
-              } catch (e) {
-                console.warn('[warn] translate failed for', k, String(e && e.message ? e.message : e));
-              }
-            }));
-          }
-        } catch (e) {
-          console.warn('[warn] Translation step failed:', e && e.message ? e.message : e);
-        }
-      }
-
+      // Normaliza y responde
+      const normal = normalizeRow(row);
+      // NOTA: aquí podríamos enriquecer (External) y actualizar DB si quieres — lo dejamos para la siguiente iteración.
       console.log('[trace] -> responding id=', id, ' scientific_name=', normal.scientific_name || '(none)');
       return res.json(normal);
     } catch (err) {
