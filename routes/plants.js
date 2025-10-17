@@ -3,6 +3,15 @@
 const express = require('express');
 const db = require('../lib/db');
 
+// Intentamos requerir el traductor; si no existe, el módulo seguirá funcionando sin traducción.
+let translator = null;
+try {
+  translator = require('../lib/translate');
+} catch (e) {
+  // no traductor disponible -> continuar sin traducción
+  translator = null;
+}
+
 module.exports = function (config = {}, PlantsModel = null, External = null) {
   const router = express.Router();
 
@@ -112,6 +121,13 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     };
   }
 
+  // campos que queremos traducir cuando el traductor está activo
+  const fieldsToTranslate = [
+    'family','scientific_name','common_name','growth_rate','hardiness_zones','height','width',
+    'type','foliage','leaf','flower','ripen','reproduction','soils','ph','preferences','tolerances',
+    'habitat','habitat_range','other_uses','description'
+  ];
+
   // GET / -> lista normalizada. Soporta ?limit=NUMBER
   router.get('/', async (req, res) => {
     try {
@@ -129,7 +145,19 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
       }
 
       if (!Array.isArray(rows)) rows = [];
-      const plants = rows.map(normalizeRow);
+      let plants = rows.map(normalizeRow);
+
+      // si hay traductor y está habilitado, intentamos traducir campos relevantes
+      if (translator && translator.ENABLE_TRANSLATE) {
+        try {
+          const translated = await Promise.all(plants.map(p => translator.translateObject(p, fieldsToTranslate)));
+          plants = translated;
+        } catch (e) {
+          console.warn('translateObject failed for list:', e && e.message ? e.message : e);
+          // en caso de fallo dejamos plants sin traducir
+        }
+      }
+
       res.json(plants);
     } catch (err) {
       console.error('Error en GET /api/plants ->', err);
@@ -151,7 +179,18 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
       }
 
       if (!row) return res.status(404).json({ error: 'No encontrada' });
-      res.json(normalizeRow(row));
+
+      let plant = normalizeRow(row);
+
+      if (translator && translator.ENABLE_TRANSLATE) {
+        try {
+          plant = await translator.translateObject(plant, fieldsToTranslate);
+        } catch (e) {
+          console.warn('translateObject failed for item id=' + id + ':', e && e.message ? e.message : e);
+        }
+      }
+
+      res.json(plant);
     } catch (err) {
       console.error('Error en GET /api/plants/:id ->', err);
       res.status(500).json({ error: 'Error interno', detail: String(err && err.message ? err.message : err) });
