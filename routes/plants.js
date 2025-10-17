@@ -107,6 +107,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
       pfaf: getFromRow(row, 'PFAF', 'pfaf') || '',
       image_url: image_url || '',
       images: image_url ? [image_url] : [],
+      description: getFromRow(row, 'description', 'Description', 'description_text') || '',
       source: 'db'
     };
   }
