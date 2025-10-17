@@ -10,6 +10,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
   try { Translator = require('../lib/translate')(config); } catch (e) { Translator = null; console.warn('Translator not available:', e && e.message ? e.message : e); }
   const TRANSLATE_ENABLED = (Translator && Translator.provider && Translator.provider !== 'none');
 
+  // runQuery: ejecuta una consulta soportando distintos clientes
   async function runQuery(sql, params = []) {
     if (!db) throw new Error('No DB connection available');
     try {
@@ -116,7 +117,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     };
   }
 
-  // GET / -> lista normalizada
+  // GET / -> lista normalizada. Soporta ?limit=NUMBER
   router.get('/', async (req, res) => {
     try {
       let rows = [];
@@ -133,18 +134,7 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
       }
 
       if (!Array.isArray(rows)) rows = [];
-      let plants = rows.map(normalizeRow);
-
-      if (TRANSLATE_ENABLED) {
-        try {
-          const translateFields = ['common_name','type','foliage'];
-          const promises = plants.map(p => Translator.translateObjectFields(p, translateFields, Translator.target).catch(e => p));
-          plants = await Promise.all(promises);
-        } catch (e) {
-          console.warn('Translation (list) failed:', e && e.message ? e.message : e);
-        }
-      }
-
+      const plants = rows.map(normalizeRow);
       res.json(plants);
     } catch (err) {
       console.error('Error en GET /api/plants ->', err);
@@ -152,137 +142,52 @@ module.exports = function (config = {}, PlantsModel = null, External = null) {
     }
   });
 
-  // GET /:id -> planta por id (ROBUST: intenta varias consultas y guarda trazas)
+  // GET /:id -> planta por id
   router.get('/:id', async (req, res) => {
-    const idParam = req.params.id;
-    try {
-      console.log(`[trace] GET /api/plants/${idParam} - comienzo`);
+    const id = req.params.id;
+    console.log('[trace] GET /api/plants/:id id=', id, ' use PlantsModel?', !!PlantsModel, 'Translator?', !!Translator);
 
-      // 1) Si PlantsModel dispone de findById, pruébalo primero
+    try {
       let row = null;
+
+      // 1) intenta usar PlantsModel si está disponible
       if (PlantsModel && typeof PlantsModel.findById === 'function') {
         try {
-          row = await PlantsModel.findById(idParam);
-          console.log(`[trace] PlantsModel.findById(${idParam}) -> ${!!row}`);
+          console.log('[trace] -> calling PlantsModel.findById(', id, ')');
+          row = await PlantsModel.findById(id);
+          console.log('[trace] -> PlantsModel.findById returned:', !!row);
         } catch (e) {
-          console.warn('[trace] PlantsModel.findById error:', e && e.message ? e.message : e);
+          console.warn('[warn] PlantsModel.findById threw:', String(e && e.message ? e.message : e));
           row = null;
         }
       }
 
-      // 2) Si no hay fila, prueba consultas SQL explícitas (id numérico, genus+species, commonname)
+      // 2) Si no encontramos nada, intenta una consulta directa al pool (fallback)
       if (!row) {
-        // try id numeric
-        if (!Number.isNaN(Number(idParam))) {
-          console.log('[trace] intentando SELECT por id numérico');
-          const rows = await runQuery('SELECT * FROM plants WHERE id = ? LIMIT 1', [Number(idParam)]);
-          if (Array.isArray(rows) && rows.length > 0) row = rows[0];
-          else if (rows && rows.id) row = rows;
-          console.log('[trace] resultado SELECT id ->', Array.isArray(rows) ? rows.length : (row ? 1 : 0));
-        }
-
-        // try scientific name / genus species fallback
-        if (!row) {
-          const guess = idParam.replace(/\+/g,' ').trim(); // allow "Genus+species"
-          if (guess.includes(' ')) {
-            const parts = guess.split(/\s+/);
-            if (parts.length >= 2) {
-              const g = parts[0];
-              const s = parts.slice(1).join(' ');
-              console.log('[trace] intentando SELECT por Genus+Species', g, s);
-              const rows2 = await runQuery('SELECT * FROM plants WHERE Genus = ? AND Species = ? LIMIT 1', [g, s]);
-              if (Array.isArray(rows2) && rows2.length > 0) row = rows2[0];
-              console.log('[trace] resultado SELECT Genus+Species ->', Array.isArray(rows2) ? rows2.length : (row ? 1 : 0));
-            }
-          }
-        }
-
-        // try CommonName search
-        if (!row) {
-          console.log('[trace] intentando SELECT por CommonName LIKE');
-          const like = `%${idParam}%`;
-          const rows3 = await runQuery('SELECT * FROM plants WHERE CommonName LIKE ? LIMIT 1', [like]);
-          if (Array.isArray(rows3) && rows3.length > 0) row = rows3[0];
-          console.log('[trace] resultado SELECT CommonName ->', Array.isArray(rows3) ? rows3.length : (row ? 1 : 0));
+        try {
+          console.log('[trace] -> fallback: querying DB directly for id=', id);
+          const rows = await runQuery('SELECT * FROM plants WHERE id = ? LIMIT 1', [id]);
+          if (Array.isArray(rows) && rows.length) row = rows[0];
+          else if (rows && rows.id) row = rows; // por si runQuery devolvió un objeto
+          console.log('[trace] -> direct DB query returned:', !!row);
+        } catch (e) {
+          console.error('[error] direct DB query failed:', e && e.message ? e.message : e);
+          row = null;
         }
       }
 
       if (!row) {
-        console.warn(`[trace] Planta idParam='${idParam}' no encontrada`);
+        console.log('[trace] -> not found id=', id);
         return res.status(404).json({ error: 'No encontrada' });
       }
 
-      console.log('[trace] Planta encontrada en DB, normalizando...');
-      let normalized = normalizeRow(row);
-
-      // Enriquecimiento (si DB-first): intenta obtener info externa y persiste nuevos campos (si aplica)
-      if (config.useDbFirst && External && typeof External === 'object') {
-        try {
-          const candidateName = normalized.scientific_name || `${normalized.genus} ${normalized.species}`.trim() || normalized.common_name || '';
-          let extra = null;
-          if (candidateName && typeof External.fetchByScientificName === 'function') extra = await External.fetchByScientificName(candidateName);
-          if (!extra && typeof External.fetchFromTrefle === 'function') extra = await External.fetchFromTrefle(candidateName || normalized.common_name || '');
-          if (!extra && typeof External.fetchFromPerenual === 'function') extra = await External.fetchFromPerenual(candidateName || normalized.common_name || '');
-          if (!extra && typeof External.fetchGeneric === 'function') extra = await External.fetchGeneric(candidateName || normalized.common_name || '');
-          if (extra && typeof extra === 'object') {
-            // merge sin sobrescribir
-            const fieldsToFill = ['family','genus','species','scientific_name','common_name','growth_rate','hardiness_zones','height','width','type','foliage','pollinators','leaf','flower','ripen','reproduction','soils','ph','ph_split','preferences','tolerances','habitat','habitat_range','edibility','medicinal','other_uses','pfaf','image_url','images','description'];
-            const toSaveDb = {};
-            const dbFieldMap = {
-              family: 'Family', genus: 'Genus', species: 'Species', common_name: 'CommonName',
-              growth_rate: 'GrowthRate', hardiness_zones: 'HardinessZones', height: 'Height', width: 'Width',
-              type: 'Type', foliage: 'Foliage', pollinators: 'Pollinators', leaf: 'Leaf', flower: 'Flower',
-              ripen: 'Ripen', reproduction: 'Reproduction', soils: 'Soils', ph: 'pH', ph_split: 'pH_split',
-              preferences: 'Preferences', tolerances: 'Tolerances', habitat: 'Habitat', habitat_range: 'HabitatRange',
-              edibility: 'Edibility', medicinal: 'Medicinal', other_uses: 'OtherUses', pfaf: 'PFAF',
-              image_url: 'ImageURL', images: 'images', description: 'description'
-            };
-            for (const key of fieldsToFill) {
-              const val = extra[key] || extra[key.charAt(0).toUpperCase() + key.slice(1)] || '';
-              if ((normalized[key] === null || normalized[key] === '' || (Array.isArray(normalized[key]) && normalized[key].length === 0))) {
-                if (val !== null && val !== '' && !(Array.isArray(val) && val.length === 0)) {
-                  normalized[key] = val;
-                  const dbCol = dbFieldMap[key];
-                  if (dbCol) toSaveDb[dbCol] = Array.isArray(val) ? JSON.stringify(val) : val;
-                }
-              }
-            }
-            if (Object.keys(toSaveDb).length > 0) {
-              try {
-                if (PlantsModel && typeof PlantsModel.updateById === 'function') {
-                  await PlantsModel.updateById(normalized.id, toSaveDb);
-                } else {
-                  const cols = Object.keys(toSaveDb).map(c => `\`${c}\` = ?`).join(', ');
-                  const params = Object.keys(toSaveDb).map(k => toSaveDb[k]);
-                  params.push(normalized.id);
-                  const sql = `UPDATE plants SET ${cols}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
-                  await runQuery(sql, params);
-                }
-                console.log('[trace] Enriquecimiento persistido en DB');
-              } catch (e) {
-                console.warn('No se pudo persistir enriquecimiento en DB (no crítico):', e && e.message ? e.message : e);
-              }
-            }
-          }
-        } catch (e) {
-          console.warn('Enriquecimiento externo falló (no crítico):', e && e.message ? e.message : e);
-        }
-      }
-
-      // Traducción (si activado)
-      if (TRANSLATE_ENABLED && Translator) {
-        try {
-          const translateFields = ['common_name','type','foliage','leaf','flower','habitat','habitat_range','preferences','other_uses','description'];
-          normalized = await Translator.translateObjectFields(normalized, translateFields, Translator.target);
-        } catch (e) {
-          console.warn('translateObjectFields failed:', e && e.message ? e.message : e);
-        }
-      }
-
-      console.log('[trace] Respondiendo planta normalizada id=', normalized.id);
-      res.json(normalized);
+      // Normaliza y responde
+      const normal = normalizeRow(row);
+      // NOTA: aquí podríamos enriquecer (External) y actualizar DB si quieres — lo dejamos para la siguiente iteración.
+      console.log('[trace] -> responding id=', id, ' scientific_name=', normal.scientific_name || '(none)');
+      return res.json(normal);
     } catch (err) {
-      console.error('Error en GET /api/plants/:id ->', err && err.stack ? err.stack : err);
+      console.error('Error en GET /api/plants/:id ->', err);
       res.status(500).json({ error: 'Error interno', detail: String(err && err.message ? err.message : err) });
     }
   });
