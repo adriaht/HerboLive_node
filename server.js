@@ -28,8 +28,6 @@ console.log('Config cargada:', {
   port: config.port,
   host: config.host,
   useDbFirst: config.useDbFirst,
-  localCsvPath: config.localCsvPath,
-  csvMaxRead: config.csvMaxRead
 });
 
 // DB pool and models
@@ -42,6 +40,8 @@ const External = require('./lib/external')(config);
 
 
 const apiRouter = require('./routes/api')(config, PlantsModel, External, db);
+
+app.use('/api/proxy', require('./routes/proxy')(config));
 app.use('/api', apiRouter);
 
 
