@@ -1,4 +1,3 @@
-// server.js (reemplaza el existente por completo)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -23,6 +22,7 @@ const config = {
   csvMaxRead: parseInt(process.env.CSV_MAX_READ || '52', 10)
 };
 
+
 // logs de arranque
 console.log('Config cargada:', {
   port: config.port,
@@ -37,20 +37,27 @@ const PlantsModel = require('./lib/models/plants')(db);
 // External helpers
 const External = require('./lib/external')(config);
 
-
-
 const apiRouter = require('./routes/api')(config, PlantsModel, External, db);
 
+// Middleware para eliminar el prefijo /herboLive de la URL para el backend
+app.use((req, res, next) => {
+  if (req.url.startsWith('/herboLive')) {
+    req.url = req.url.slice('/herboLive'.length) || '/';
+  }
+  next();
+});
+
+// Montar rutas API sin el prefijo extra (ya modificado con middleware anterior)
 app.use('/api/proxy', require('./routes/proxy')(config));
 app.use('/api', apiRouter);
 
-
-// Routes
 const plantsRouter = require('./routes/plants')(config, PlantsModel, External);
 app.use('/api/plants', plantsRouter);
 
+// Servir archivos estáticos del frontend bajo /herboLive
+app.use('/herboLive', express.static(path.join(__dirname, '../www')));
 
-// Exponer endpoint de config (útil para frontend para saber preferencia)
+// Endpoint config para la preferencia en frontend
 app.get('/api/config', (req, res) => {
   res.json({
     ok: true,
@@ -62,13 +69,13 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, mode: config.useDbFirst ? 'db-first' : 'api-first' });
 });
 
-// error handler middleware para capturar problemas no manejados
+// error handler para errores no capturados
 app.use((err, req, res, next) => {
   console.error('Unhandled err:', err && err.stack ? err.stack : err);
   res.status(500).json({ error: 'Internal Server Error', detail: String(err) });
 });
 
-// arrancar
+// arrancar servidor
 const server = app.listen(config.port, config.host, () => {
   console.log(`HerboLive backend listening on http://${config.host}:${config.port} (DB-first=${config.useDbFirst})`);
 });
@@ -78,7 +85,7 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-// manejo de señales para apagar limpio
+// manejo de signals para apagado limpio
 process.on('SIGINT', () => {
   console.log('SIGINT received — closing server');
   server.close(() => process.exit(0));
