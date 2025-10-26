@@ -1,31 +1,27 @@
 // routes/api.js
-// Router /api que obtiene datos desde DB (no enriquece por defecto).
+// Router /api que obtiene datos desde DB, los enriquece con External APIs y traduce al español.
+//
 // Uso: module.exports = (config, PlantsModel, External, db) => router
+// - config: objeto de configuración (usa config.useDbFirst para alternar comportamiento)
+// - PlantsModel: el modelo que implementa findById, listAll, findByQuery (optional)
+// - External: módulo con funciones fetchFromPerenual(name) y fetchFromTrefle(name) (optional)
+// - db: conexión/pool directo (optional)
 
 const express = require('express');
 const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
 
 module.exports = function(config = {}, PlantsModel = null, External = null, db = null) {
   const router = express.Router();
 
-  // --- Config ---
-  const TRANSLATE_PROVIDER = (process.env.TRANSLATE_PROVIDER || 'none').toLowerCase();
+  // --- Config de traducción (por environment variables) ---
+  const TRANSLATE_PROVIDER = (process.env.TRANSLATE_PROVIDER || 'none').toLowerCase(); // none | libretranslate | deepl | google
   const TRANSLATE_API_KEY = process.env.TRANSLATE_API_KEY || '';
-  const TRANSLATE_API_URL = process.env.TRANSLATE_API_URL || 'https://libretranslate.de/translate';
+  const TRANSLATE_API_URL = process.env.TRANSLATE_API_URL || 'https://libretranslate.de/translate'; // si libretranslate personalizada
   const TRANSLATE_TARGET = 'es';
 
-  // máximo total que aceptaremos devolver cuando el cliente pida "todo" (protegemos servidor)
-  const MAX_TOTAL_FETCH = parseInt(process.env.MAX_TOTAL_FETCH || '2000', 10);
-  // máximo por página (por seguridad)
-  const MAX_PAGE_SIZE = parseInt(process.env.MAX_PAGE_SIZE || '1000', 10);
-  // carpeta local para guardar imágenes descargadas por endpoint
-  const LOCAL_IMG_DIR = process.env.LOCAL_IMG_DIR || '/var/www/html/herbolive/img/plants';
-
+  // cache de traducciones en memoria
   const translateCache = new Map();
 
-  /* ---------- helpers (translate, mapLimit) ---------- */
   async function mapLimit(items, limit, fn) {
     const results = new Array(items.length);
     let i = 0;
@@ -58,6 +54,7 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
 
     try {
       let translated = s;
+
       if (TRANSLATE_PROVIDER === 'libretranslate') {
         const res = await fetch(TRANSLATE_API_URL, {
           method: 'POST',
@@ -94,6 +91,7 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
         const j = await res.json();
         translated = (j.data && j.data.translations && j.data.translations[0] && j.data.translations[0].translatedText) || s;
       }
+
       translateCache.set(cacheKey, translated);
       return translated;
     } catch (e) {
@@ -165,25 +163,6 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
     return null;
   }
 
-  // Normaliza description y other_uses para devolver siempre string "plano".
-  function normalizeTextishField(raw) {
-    if (raw === null || typeof raw === 'undefined') return '';
-    if (Array.isArray(raw)) return raw.map(x => String(x)).join(', ');
-    if (typeof raw === 'object') {
-      try { return Object.values(raw).map(x => String(x)).join(', '); } catch (e) { return String(raw); }
-    }
-    const s = String(raw).trim();
-    if (!s) return '';
-    try {
-      const parsed = JSON.parse(s);
-      if (Array.isArray(parsed)) return parsed.map(x => String(x)).join(', ');
-      if (typeof parsed === 'object' && parsed !== null) return Object.values(parsed).map(x => String(x)).join(', ');
-      return String(parsed);
-    } catch (e) {
-      return s;
-    }
-  }
-
   function normalizeRowRaw(row) {
     const genus = getFromRow(row, 'Genus', 'genus');
     const species = getFromRow(row, 'Species', 'species');
@@ -196,12 +175,6 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
     const pollinatorsRaw = getFromRow(row, 'Pollinators', 'pollinators') || '';
     const preferencesRaw = getFromRow(row, 'Preferences', 'preferences') || '';
     const tolerancesRaw = getFromRow(row, 'Tolerances', 'tolerances') || '';
-
-    const rawDescription = getFromRow(row, 'description', 'Description', 'description_text');
-    const rawOtherUses = getFromRow(row, 'OtherUses', 'other_uses');
-
-    const descriptionNormalized = normalizeTextishField(rawDescription);
-    const otherUsesNormalized = normalizeTextishField(rawOtherUses);
 
     return {
       id: getFromRow(row, 'id', 'ID') || null,
@@ -230,20 +203,18 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
       habitat_range: getFromRow(row, 'HabitatRange', 'habitat_range') || '',
       edibility: parseFlag(getFromRow(row, 'Edibility', 'edibility')),
       medicinal: parseFlag(getFromRow(row, 'Medicinal', 'medicinal')),
-      other_uses: otherUsesNormalized || '',
+      other_uses: getFromRow(row, 'OtherUses', 'other_uses') || '',
       pfaf: getFromRow(row, 'PFAF', 'pfaf') || '',
       image_url: image_url || '',
       images: image_url ? [image_url] : [],
-      description: descriptionNormalized || '',
-      // new fields
-      enriched: parseFlag(getFromRow(row, 'enriched')),
-      local_image: getFromRow(row, 'local_image') || null,
+      description: getFromRow(row, 'description', 'Description', 'description_text') || '',
+      // read enriched flag from DB (0/1 or true/false)
+      enriched: parseFlag(getFromRow(row, 'enriched', 'Enriched') ) || false,
       source: 'db'
     };
   }
 
   async function enrichPlantData(normalized) {
-    // kept for optional usage (only called if ?enrich=1)
     const out = Object.assign({}, normalized);
 
     let lookupName = out.scientific_name || `${out.genus} ${out.species}`.trim();
@@ -288,118 +259,108 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
     return out;
   }
 
-  /* ---------- Routes ---------- */
+  // Rutas
 
-  // GET /api/plants?q=...&page=1&perPage=100  (returns { rows, total, page, perPage } )
   router.get('/plants', async (req, res) => {
     try {
       const dbFirst = !!(config && config.useDbFirst);
 
-      // parse pagination params
-      const page = req.query.page ? Math.max(1, parseInt(req.query.page, 10) || 1) : 1;
-      let perPage = (typeof req.query.perPage !== 'undefined') ? parseInt(req.query.perPage, 10) : (req.query.limit ? parseInt(req.query.limit, 10) : 50);
-      if (!perPage || perPage <= 0) {
-        // if client asks perPage=0 treat as perPage=MAX_PAGE_SIZE but cap to MAX_PAGE_SIZE
-        perPage = MAX_PAGE_SIZE;
+      // Compute requested paging/limits (support perPage or limit)
+      let page = req.query.page ? parseInt(req.query.page, 10) : 1;
+      let perPage = req.query.perPage ? parseInt(req.query.perPage, 10) : (req.query.limit ? parseInt(req.query.limit, 10) : 50);
+
+      // Interpret perPage===0 or limit===0 as "no limit" (do not apply LIMIT)
+      if (perPage === 0) {
+        console.log('[api] client requested perPage=0 (no limit) -> NO LIMIT will be applied to DB queries');
       }
-      if (perPage > MAX_PAGE_SIZE) perPage = MAX_PAGE_SIZE;
-
-      // prevent accidental huge fetches if they requested "all"
-      const maxTotal = MAX_TOTAL_FETCH;
-
-      let rows = [], total = null;
 
       if (dbFirst) {
-        // Prefer PlantsModel if available
-        if (PlantsModel && typeof PlantsModel.findByQuery === 'function' && req.query.q) {
-          // model handles pagination
-          const q = req.query.q;
-          const data = await PlantsModel.findByQuery(q, page, perPage);
-          rows = data.rows || [];
-          total = (data.total !== undefined ? data.total : null);
-        } else if (PlantsModel && typeof PlantsModel.listAll === 'function' && !req.query.q) {
+        let rows = [];
+        if (PlantsModel && typeof PlantsModel.listAll === 'function' && !req.query.q) {
+          // listing all (not a text search) -> delegate to PlantsModel (supports perPage <= 0)
           const data = await PlantsModel.listAll(page, perPage);
           rows = data.rows || [];
-          total = (data.total !== undefined ? data.total : null);
+        } else if (PlantsModel && typeof PlantsModel.findByQuery === 'function' && req.query.q) {
+          // search by q (DB-first) -> delegate to PlantsModel (supports perPage <= 0)
+          const q = req.query.q;
+          console.log('[api] DB-first search q=', q, ' page=', page, ' perPage=', perPage);
+          const data = await PlantsModel.findByQuery(q, page, perPage);
+          rows = data.rows || [];
         } else if (db) {
-          // raw db queries
+          // direct DB queries fallback -> build query with or without LIMIT according to perPage
           if (req.query.q) {
             const q = `%${req.query.q}%`;
-            const offset = (page - 1) * perPage;
-            const qRows = await db.query(
-              `SELECT * FROM plants WHERE CommonName LIKE ? OR CONCAT(Genus,' ',Species) LIKE ? OR Family LIKE ? ORDER BY CommonName LIMIT ? OFFSET ?`,
-              [q, q, q, perPage, offset]
-            ).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-            const countRows = await db.query(
-              `SELECT COUNT(*) as total FROM plants WHERE CommonName LIKE ? OR CONCAT(Genus,' ',Species) LIKE ? OR Family LIKE ?`,
-              [q, q, q]
-            ).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-            rows = qRows || [];
-            total = (Array.isArray(countRows) && countRows[0] && countRows[0].total !== undefined) ? countRows[0].total : null;
+            if (perPage && perPage > 0) {
+              rows = await db.query(`SELECT * FROM plants WHERE CommonName LIKE ? OR CONCAT(Genus,' ',Species) LIKE ? OR Family LIKE ? LIMIT ?`, [q, q, q, perPage]).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
+            } else {
+              rows = await db.query(`SELECT * FROM plants WHERE CommonName LIKE ? OR CONCAT(Genus,' ',Species) LIKE ? OR Family LIKE ?`, [q, q, q]).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
+            }
           } else {
-            const offset = (page - 1) * perPage;
-            const qRows = await db.query(`SELECT * FROM plants ORDER BY CommonName LIMIT ? OFFSET ?`, [perPage, offset])
-              .then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-            const countRows = await db.query(`SELECT COUNT(*) as total FROM plants`)
-              .then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-            rows = qRows || [];
-            total = (Array.isArray(countRows) && countRows[0] && countRows[0].total !== undefined) ? countRows[0].total : null;
+            if (perPage && perPage > 0) {
+              rows = await db.query(`SELECT * FROM plants LIMIT ?`, [perPage]).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
+            } else {
+              rows = await db.query(`SELECT * FROM plants`).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
+            }
           }
         } else {
           return res.status(500).json({ error: 'No DB/model disponible para modo DB-first' });
         }
 
-        // normalize
+        // Normalize
         const normalized = rows.map(normalizeRowRaw);
 
-        // Decide whether to enrich: only if client explicitly requests ?enrich=1
-        if (req.query.enrich === '1') {
-          const enriched = await mapLimit(normalized, 6, async (nr) => {
-            return await enrichPlantData(nr);
-          });
-          // translate if requested? Keep translations optional
-          if (TRANSLATE_PROVIDER && TRANSLATE_PROVIDER !== 'none') {
-            const translated = [];
-            for (const p of enriched) translated.push(await translateObjectDeep(p));
-            return res.json({ rows: translated, total, page, perPage });
+        // Enrich: skip if already enriched in DB; otherwise enrich and mark enriched=1
+        console.log('[api] Enrichment pass: items=', normalized.length);
+        const enriched = await mapLimit(normalized, 6, async (nr) => {
+          // Skip if already enriched
+          if (nr && nr.enriched) {
+            console.log('[api] skip enrich (already enriched) id=', nr.id, ' scientific_name=', nr.scientific_name);
+            return nr;
           }
-          return res.json({ rows: enriched, total, page, perPage });
-        } else {
-          // do not enrich — return DB-normalized rows, include enriched flag
-          return res.json({ rows: normalized, total, page, perPage });
+          // perform enrichment
+          const enr = await enrichPlantData(nr);
+          // If we have a DB/pool, mark as enriched=1
+          if (db && nr && nr.id) {
+            try {
+              await db.query('UPDATE plants SET enriched = 1 WHERE id = ?', [nr.id]);
+              console.log('[api] marked enriched=1 in DB for id=', nr.id);
+            } catch (e) {
+              console.warn('[api] failed to mark enriched in db for id=', nr.id, e && e.message ? e.message : e);
+            }
+          }
+          // return enriched object, set enriched flag locally true
+          enr.enriched = true;
+          return enr;
+        });
+
+        // Translate deep
+        const translated = [];
+        for (const p of enriched) {
+          translated.push(await translateObjectDeep(p));
         }
+
+        return res.json(translated);
       } else {
-        // API-first fallback (same behavior: don't enrich unless ?enrich=1)
+        // non-db-first branch (unchanged logic but respects limit/perPage)
+        let rows = [];
         if (PlantsModel && typeof PlantsModel.listAll === 'function') {
           const data = await PlantsModel.listAll(1, perPage);
           rows = data.rows || [];
-          total = (data.total !== undefined ? data.total : null);
         } else if (db) {
-          const offset = 0;
-          const qRows = await db.query(`SELECT * FROM plants ORDER BY CommonName LIMIT ? OFFSET ?`, [perPage, offset])
-            .then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-          rows = qRows || [];
-          const countRows = await db.query(`SELECT COUNT(*) as total FROM plants`)
-            .then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-          total = (Array.isArray(countRows) && countRows[0] && countRows[0].total !== undefined) ? countRows[0].total : null;
+          if (perPage && perPage > 0) {
+            rows = await db.query(`SELECT * FROM plants LIMIT ?`, [perPage]).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
+          } else {
+            rows = await db.query(`SELECT * FROM plants`).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
+          }
         } else {
           return res.status(500).json({ error: 'No DB/model disponible' });
         }
-
         const normalized = rows.map(normalizeRowRaw);
-
-        if (req.query.enrich === '1') {
-          const enriched = await mapLimit(normalized, 6, async (nr) => {
-            return await enrichPlantData(nr);
-          });
-          const translated = [];
-          for (const p of enriched) translated.push(await translateObjectDeep(p));
-          return res.json({ rows: translated, total, page: 1, perPage });
-        }
-
         const translated = [];
-        for (const p of normalized) translated.push(await translateObjectDeep(p));
-        return res.json({ rows: translated, total, page: 1, perPage });
+        for (const p of normalized) {
+          translated.push(await translateObjectDeep(p));
+        }
+        return res.json(translated);
       }
     } catch (err) {
       console.error('Error en /api/plants ->', err && err.stack ? err.stack : err);
@@ -407,7 +368,6 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
     }
   });
 
-  // GET /api/plants/:id -> devuelve planta normalizada y opcionalmente enriquecida si ?enrich=1
   router.get('/plants/:id', async (req, res) => {
     const id = req.params.id;
     try {
@@ -429,78 +389,28 @@ module.exports = function(config = {}, PlantsModel = null, External = null, db =
 
       const normalized = normalizeRowRaw(row);
 
-      if (req.query.enrich === '1') {
-        const enriched = await enrichPlantData(normalized);
-        const translated = await translateObjectDeep(enriched);
-        return res.json(translated);
+      // if already enriched, skip external calls
+      let enriched = normalized;
+      if (!normalized.enriched) {
+        enriched = await enrichPlantData(normalized);
+        enriched.enriched = true;
+        if (db && normalized.id) {
+          try {
+            await db.query('UPDATE plants SET enriched = 1 WHERE id = ?', [normalized.id]);
+            console.log('[api] marked enriched=1 in DB for id=', normalized.id);
+          } catch (e) {
+            console.warn('[api] failed to mark enriched in db for id=', normalized.id, e && e.message ? e.message : e);
+          }
+        }
       } else {
-        const translated = await translateObjectDeep(normalized);
-        return res.json(translated);
+        console.log('[api] GET /plants/:id skip enrich (already enriched) id=', normalized.id);
       }
+
+      const translated = await translateObjectDeep(enriched);
+      return res.json(translated);
     } catch (err) {
       console.error('Error en /api/plants/:id ->', err && err.stack ? err.stack : err);
       res.status(500).json({ error: 'Error interno', detail: String(err && err.message ? err.message : err) });
-    }
-  });
-
-  // POST /api/plants/:id/saveImage
-  // Body: { url: 'https://...' , filename: 'optional-filename.ext' }
-  // Descarga la imagen indicada y guarda en LOCAL_IMG_DIR, actualiza plants.local_image si la columna existe.
-  router.post('/plants/:id/saveImage', async (req, res) => {
-    const id = req.params.id;
-    const url = req.body && (req.body.url || req.query.url);
-    const filename = req.body && req.body.filename ? req.body.filename : null;
-    if (!url) return res.status(400).json({ error: 'Missing url' });
-
-    try {
-      // Ensure folder exists
-      try { fs.mkdirSync(LOCAL_IMG_DIR, { recursive: true }); } catch (e) { /* ignore */ }
-
-      // determine filename
-      let name = filename;
-      if (!name) {
-        const parsed = path.parse(new URL(url).pathname || '');
-        name = parsed.base || `plant_${id}_${Date.now()}`; // fallback
-      }
-      // sanitize name: remove query parts
-      name = name.split('?')[0].replace(/[^a-zA-Z0-9_\-\.]/g, '_');
-
-      const destPath = path.join(LOCAL_IMG_DIR, name);
-
-      // fetch stream
-      const resp = await fetch(url);
-      if (!resp.ok) return res.status(502).json({ error: 'Failed to download image', status: resp.status });
-
-      const fileStream = fs.createWriteStream(destPath);
-      await new Promise((resolve, reject) => {
-        resp.body.pipe(fileStream);
-        resp.body.on('error', reject);
-        fileStream.on('finish', resolve);
-      });
-
-      // update DB if column exists
-      try {
-        // check column exists
-        const colCheck = await db.query(
-          "SELECT COUNT(*) AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='plants' AND COLUMN_NAME='local_image'"
-        ).then(r => Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r);
-        const hasCol = (Array.isArray(colCheck) && colCheck[0] && colCheck[0].c) ? (colCheck[0].c > 0) : (colCheck && colCheck.c ? colCheck.c > 0 : false);
-
-        if (hasCol) {
-          const relPath = path.relative('/var/www/html', destPath).replace(/\\/g, '/'); // e.g. herbolive/img/plants/xxx
-          await db.query('UPDATE plants SET local_image = ? WHERE id = ?', [relPath, id]);
-        } else {
-          // column not present — don't fail, inform client
-          console.warn('local_image column not present, not updating DB');
-        }
-      } catch (e) {
-        console.warn('error updating local_image in db', e && e.message ? e.message : e);
-      }
-
-      return res.json({ ok: true, saved: destPath });
-    } catch (e) {
-      console.error('saveImage error', e && e.stack ? e.stack : e);
-      return res.status(500).json({ error: 'save error', detail: String(e && e.message ? e.message : e) });
     }
   });
 

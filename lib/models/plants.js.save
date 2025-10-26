@@ -1,0 +1,38 @@
+ # Versión interactiva: te pedirá la contraseña para cada comando mysql                                                  # Versión interactiva: te pedirá la contraseña para cada comando mysqlmprobando / añadiendo columna 'enriched' y creando índice si hace falta..."
+echo "Comprobando / añadiendo columna 'enriched' y creando índice si hace falta..."
+# 1) comprobar existencia columna
+# 1) comprobar existencia columnaSELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='herbolive' AND TABL
+mysql -u adminHervo -p -N -s -e "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='herbolive' AND TABLE_NAME='plants' AND COLUMN_NAME='enriched';" > /tmp/_has_enriched.txt
+HAS=$(cat /tmp/_has_enriched.txt)
+echo "has_enriched = $HAS"
+if [ "$HAS" -eq 0 ]; then
+if [ "$HAS" -eq 0 ]; then enriched..."
+  echo "Añadiendo columna enriched...""ALTER TABLE plants ADD COLUMN enriched TINYINT(1) NOT NULL DEFAULT 0;"
+  mysql -u adminHervo -p herbolive -e "ALTER TABLE plants ADD COLUMN enriched TINYINT(1) NOT NULL DEFAULT 0;"
+elseho "La columna enriched ya existe, no se añadirá."
+  echo "La columna enriched ya existe, no se añadirá."
+fi
+# 2) comprobar índice
+# 2) comprobar índicep -N -s -e "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='herbolive' AND T
+mysql -u adminHervo -p -N -s -e "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='herbolive' AND TABLE_NAME='plants' AND INDEX_NAME='idx_plants_enriched';" > /tmp/_has_idx.txt
+HASIDX=$(cat /tmp/_has_idx.txt)ched = $HASIDX"
+echo "has_index idx_plants_enriched = $HASIDX"
+if [ "$HASIDX" -eq 0 ]; thenlants_enriched..."
+  echo "Creando índice idx_plants_enriched..."INDEX idx_plants_enriched ON plants(enriched);"
+  mysql -u adminHervo -p herbolive -e "CREATE INDEX idx_plants_enriched ON plants(enriched);"
+elseho "Índice idx_plants_enriched ya existe."
+  echo "Índice idx_plants_enriched ya existe."
+fi
+echo "Hecho."
+echo "Hecho."
+Comprobando / añadiendo columna 'enriched' y creando índice si hace falta...
+Enter password:
+has_enriched = 0
+Añadiendo columna enriched...
+Enter password:
+Enter password:
+has_index idx_plants_enriched = 0
+Creando índice idx_plants_enriched...
+Enter password:
+Hecho.
+super@ahernandeztorredemer:/opt/herbolive/HerboLive_node$
